@@ -32,7 +32,7 @@ exiftool_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'I
 
 # -------- convenience methods -------------
 
-def parse_date_exif(date_string):
+def parse_date_exif(date_string, localtime):
     """
     extract date info from EXIF data
     YYYY:MM:DD HH:MM:SS
@@ -77,19 +77,20 @@ def parse_date_exif(date_string):
             minute = int(time[1])
 
         # adjust for time-zone if needed
-        if len(time_entries) > 2:
-            time_zone = time_entries[2].split(':')  # ['HH', 'MM']
+        if not localtime:
+            if len(time_entries) > 2:
+                time_zone = time_entries[2].split(':')  # ['HH', 'MM']
 
-            if len(time_zone) == 2:
-                time_zone_hour = int(time_zone[0])
-                time_zone_min = int(time_zone[1])
+                if len(time_zone) == 2:
+                    time_zone_hour = int(time_zone[0])
+                    time_zone_min = int(time_zone[1])
 
-                # check if + or -
-                if time_entries[1] == '+':
-                    time_zone_hour *= -1
+                    # check if + or -
+                    if time_entries[1] == '+':
+                        time_zone_hour *= -1
 
-                dateadd = timedelta(hours=time_zone_hour, minutes=time_zone_min)
-                time_zone_adjust = True
+                    dateadd = timedelta(hours=time_zone_hour, minutes=time_zone_min)
+                    time_zone_adjust = True
 
 
     # form date object
@@ -112,7 +113,7 @@ def parse_date_exif(date_string):
 
 
 
-def get_oldest_timestamp(data, additional_groups_to_ignore, additional_tags_to_ignore, print_all_tags=False):
+def get_oldest_timestamp(data, additional_groups_to_ignore, additional_tags_to_ignore, localtime, print_all_tags=False):
     """data as dictionary from json.  Should contain only time stamps except SourceFile"""
 
     # save only the oldest date
@@ -147,7 +148,7 @@ def get_oldest_timestamp(data, additional_groups_to_ignore, additional_tags_to_i
                 date = date[0]
 
             try:
-                exifdate = parse_date_exif(date)  # check for poor-formed exif data, but allow continuation
+                exifdate = parse_date_exif(date, localtime)  # check for poor-formed exif data, but allow continuation
             except Exception as e:
                 exifdate = None
 
@@ -177,6 +178,32 @@ def check_for_early_morning_photos(date, day_begins):
         date = date - timedelta(hours=date.hour+1)  # push it to the day before for classificiation purposes
 
     return date
+
+
+def find_live_photo_pairs(file_list):
+    """Find iPhone Live Photo pairs (same stem, image + video)"""
+    image_exts = {'.heic', '.jpg', '.jpeg', '.png', '.tiff', '.tif'}
+    video_exts = {'.mov', '.mp4'}
+
+    by_stem = {}
+    for f in file_list:
+        stem, ext = os.path.splitext(f)
+        ext = ext.lower()
+        if ext in image_exts or ext in video_exts:
+            by_stem.setdefault(stem, {})
+            if ext in image_exts:
+                by_stem[stem]['image'] = f
+            elif ext in video_exts:
+                by_stem[stem]['video'] = f
+
+    paired_videos = set()
+    image_to_video = {}
+    for _, p in by_stem.items():
+        if 'image' in p and 'video' in p:
+            paired_videos.add(p['video'])
+            image_to_video[p['image']] = p['video']
+
+    return paired_videos, image_to_video
 
 
 #  this class is based on code from Sven Marnach (http://stackoverflow.com/questions/10075115/call-exiftool-from-a-python-script)
@@ -228,7 +255,8 @@ class ExifTool(object):
 def sortPhotos(src_dir, dest_dir, sort_format, rename_format, recursive=False,
         copy_files=False, test=False, remove_duplicates=True, day_begins=0,
         additional_groups_to_ignore=['File'], additional_tags_to_ignore=[],
-        use_only_groups=None, use_only_tags=None, verbose=True, keep_filename=False):
+        use_only_groups=None, use_only_tags=None, verbose=True, keep_filename=False,
+        localtime=False):
     """
     This function is a convenience wrapper around ExifTool based on common usage scenarios for sortphotos.py
 
@@ -251,6 +279,8 @@ def sortPhotos(src_dir, dest_dir, sort_format, rename_format, recursive=False,
         True if you want files to be copied over from src_dir to dest_dir rather than moved
     test : bool
         True if you just want to simulate how the files will be moved without actually doing any moving/copying
+    localtime : bool
+        True if you want to keep current local file time
     remove_duplicates : bool
         True to remove files that are exactly the same in name and a file hash
     keep_filename : bool
@@ -306,6 +336,10 @@ def sortPhotos(src_dir, dest_dir, sort_format, rename_format, recursive=False,
         sys.stdout.flush()
         metadata = e.get_metadata(*args)
 
+    # find Live Photo pairs for consistent timestamp handling
+    all_src_paths = [data['SourceFile'] for data in metadata]
+    paired_videos, image_to_video = find_live_photo_pairs(all_src_paths)
+
     # setup output to screen
     num_files = len(metadata)
     print()
@@ -317,7 +351,7 @@ def sortPhotos(src_dir, dest_dir, sort_format, rename_format, recursive=False,
     for idx, data in enumerate(metadata):
 
         # extract timestamp date for photo
-        src_file, date, keys = get_oldest_timestamp(data, additional_groups_to_ignore, additional_tags_to_ignore)
+        src_file, date, keys = get_oldest_timestamp(data, additional_groups_to_ignore, additional_tags_to_ignore, localtime)
 
         # fixes further errors when using unicode characters like "\u20AC"
         src_file.encode('utf-8')
@@ -348,6 +382,13 @@ def sortPhotos(src_dir, dest_dir, sort_format, rename_format, recursive=False,
         if os.path.basename(src_file).startswith('.'):
             print('hidden file.  will be skipped')
             print()
+            continue
+
+        # skip video component of Live Photo pairs (handled with its paired image)
+        if src_file in paired_videos:
+            if verbose:
+                print('Live Photo video - will be handled with its paired image')
+                print()
             continue
 
         if verbose:
@@ -432,6 +473,55 @@ def sortPhotos(src_dir, dest_dir, sort_format, rename_format, recursive=False,
                 else:
                     shutil.move(src_file, dest_file)
 
+        # if this file is an image in a Live Photo pair, also handle the paired video
+        if src_file in image_to_video:
+            video_src = image_to_video[src_file]
+            if os.path.exists(video_src):
+                _, video_ext = os.path.splitext(video_src)
+                if rename_format is not None:
+                    video_filename = date.strftime(rename_format) + video_ext.lower()
+                else:
+                    video_filename = os.path.basename(video_src)
+
+                video_dest = os.path.join(os.path.dirname(dest_file), video_filename)
+
+                # handle collisions for video
+                vroot, vext = os.path.splitext(video_dest)
+                vappend = 1
+                vfileIsIdentical = False
+
+                while True:
+                    if (not test and os.path.isfile(video_dest)) or (test and video_dest in test_file_dict.keys()):
+                        if test:
+                            vdest_compare = test_file_dict[video_dest]
+                        else:
+                            vdest_compare = video_dest
+                        if remove_duplicates and filecmp.cmp(video_src, vdest_compare):
+                            vfileIsIdentical = True
+                            if verbose:
+                                print('Identical video already exists.  Duplicate will be ignored.\n')
+                            break
+                        else:
+                            if keep_filename:
+                                orig_filename = os.path.splitext(os.path.basename(video_src))[0]
+                                video_dest = vroot + '_' + orig_filename + '_' + str(vappend) + vext
+                            else:
+                                video_dest = vroot + '_' + str(vappend) + vext
+                            vappend += 1
+                            if verbose:
+                                print('Same name already exists for video...renaming to: ' + video_dest)
+                    else:
+                        break
+
+                if test:
+                    test_file_dict[video_dest] = video_src
+                elif not vfileIsIdentical:
+                    if copy_files:
+                        shutil.copy2(video_src, video_dest)
+                    else:
+                        shutil.move(video_src, video_dest)
+                    if verbose:
+                        print('Live Photo video moved/copied to: ' + video_dest)
 
 
         if verbose:
@@ -455,6 +545,7 @@ def main():
     parser.add_argument('-c', '--copy', action='store_true', help='copy files instead of move')
     parser.add_argument('-s', '--silent', action='store_true', help='don\'t display parsing details.')
     parser.add_argument('-t', '--test', action='store_true', help='run a test.  files will not be moved/copied\ninstead you will just a list of would happen')
+    parser.add_argument('-l', '--localtime', action='store_true', help='Keep local file time instead of using UTC')
     parser.add_argument('--sort', type=str, default='%Y/%m-%b',
                         help="choose destination folder structure using datetime format \n\
     https://docs.python.org/2/library/datetime.html#strftime-and-strptime-behavior. \n\
@@ -497,7 +588,7 @@ def main():
     sortPhotos(args.src_dir, args.dest_dir, args.sort, args.rename, args.recursive,
         args.copy, args.test, not args.keep_duplicates, args.day_begins,
         args.ignore_groups, args.ignore_tags, args.use_only_groups,
-        args.use_only_tags, not args.silent, args.keep_filename)
+        args.use_only_tags, not args.silent, args.keep_filename, args.localtime)
 
 if __name__ == '__main__':
     main()
